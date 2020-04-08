@@ -9,6 +9,9 @@
 #define BPM 120.0f
 #define SAMPLE(x) (Uint8(((x) * 0.5f + 0.5f) * 255.0f))
 #define LERP(a, b, t) ((1.0f - (t)) * (a) + (b) * (t))
+#define MIX(a, b) ((a) + (b) - (a) * (b))
+#define HERTZ (1.0 / 60.0)
+#define CHANNELS 7
 
 class Phase {
 public:
@@ -24,6 +27,10 @@ public:
 
 	float norm(float freq) {
 		return get(freq) / (M_PI * 2.0f);
+	}
+
+	void reset() {
+		m_phase = 0.0f;
 	}
 
 protected:
@@ -156,14 +163,6 @@ private:
 		m_out;
 };
 
-struct Event {
-	enum Type { NoteOn = 0, NoteOff };
-	Type type{ NoteOff };
-	int note{ 0 };
-	int length{ 1 };
-	bool vibrato{ false };
-};
-
 static const float NOTE[] = {
 	32.70320f,
 	34.64783f,
@@ -194,83 +193,163 @@ enum Note {
 	B
 };
 
+enum ArpeggioType {
+	Off = 0,
+	Major,
+	Minor,
+	Maj7,
+	Min7,
+	Sus4,
+	Sus2
+};
+
+struct Sound {
+	int note{ Note::C + 24 };
+	bool vibrato{ false }, slide{ false };
+	float fine{ 0.0f };
+
+	ArpeggioType arpeggio{ ArpeggioType::Off };
+
+	float frequency(int noteOffset = 0) const {
+		const int n = note + noteOffset;
+		return NOTE[n % 12] * std::pow(2, n / 12) + fine;
+	}
+};
+
 class Channel {
 public:
 	Channel() {
 		m_waveTable.setWaveForm(WaveTable::Sine);
-		m_amplitudeEnv.attack(0.05f);
-		m_amplitudeEnv.decay(0.45f);
-		m_amplitudeEnv.sustain(0.0f);
+		m_amplitudeEnv.attack(0.002f);
+		m_amplitudeEnv.decay(0.0f);
+		m_amplitudeEnv.sustain(1.0f);
 		m_amplitudeEnv.release(0.5f);
 	}
 
 	float sample() {
-		if (m_events.empty()) return 0.0f;
-
 		const float delay = (60000.0f / BPM) / 1000.0f;
+
+		int noff = 0;
+		switch (m_current.arpeggio) {
+			default: noff = 0; break;
+			case ArpeggioType::Major: {
+				const int offs[3] = { 0, 4, 7 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 8) * 3)];
+			} break;
+			case ArpeggioType::Minor: {
+				const int offs[3] = { 0, 3, 7 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 8) * 3)];
+			} break;
+			case ArpeggioType::Sus4: {
+				const int offs[3] = { 0, 5, 7 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 8) * 3)];
+			} break;
+			case ArpeggioType::Sus2: {
+				const int offs[3] = { 0, 2, 7 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 8) * 3)];
+			} break;
+			case ArpeggioType::Maj7: {
+				const int offs[4] = { 0, 4, 7, 10 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 6) * 4)];
+			} break;
+			case ArpeggioType::Min7: {
+				const int offs[4] = { 0, 3, 7, 10 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 6) * 4)];
+			} break;
+		}
+
+		float freq = m_current.frequency(noff);
+		if (m_current.slide && (m_bar % 4) == 0 && m_sliding) {
+			float t = m_time / delay;
+			freq = LERP(m_previous.frequency(noff), freq, t);
+			if (t >= 1.0f - 1e-4f) {
+				m_sliding = false;
+			}
+		}
+
+		if (m_current.vibrato) {
+			freq += std::sin(m_phase.get(HERTZ * BPM * 4)) * (NOTE[4] - NOTE[0]);
+		}
 
 		m_time += (1.0f / SR) * 8.0f;
 		if (m_time >= delay) {
-			if (m_timeUnits-- < 0) {
-				if (m_current != nullptr) {
-					float freq = NOTE[m_current->note % 12] * std::pow(2, m_current->note / 12);
-					m_prevFreq = freq;
-				}
-				m_current = nullptr;
-				if (m_amplitudeEnv.value() > 0.0f) {
-					m_amplitudeEnv.gate(false);
-				}
-			}
-			m_time = 0.0f;
+			m_bar++;
+			m_time -= delay;
 		}
 
-		if (m_current == nullptr && m_position < m_events.size()) {
-			m_current = &m_events[m_position++];
-			m_timeUnits = m_current->length;
-			
-			m_amplitudeEnv.gate(true);
-		}
-
-		if (m_current != nullptr && m_current->type == Event::NoteOn) {
-			float freq = NOTE[m_current->note % 12] * std::pow(2, m_current->note / 12);
-
-			if (m_portamento && m_timeUnits == m_current->length) {
-				freq = LERP(m_prevFreq, freq, m_time / delay);
-			}
-
-			if (m_current->vibrato) {
-				freq += std::cos(m_vibratoPhase.get((1.0f / 60.0f) * BPM * 4.0f)) * (NOTE[2] - NOTE[0]);
-			}
-
-			return m_waveTable.sample(freq) * m_amplitudeEnv.sample(SR);
-		}
-		return 0.0f;
+		return m_waveTable.sample(freq) * m_amplitudeEnv.sample(SR) * 0.18f;
 	}
 
-	void pushNote(int note, int length = 1, Event::Type type = Event::NoteOn, bool vibrato = false) {
-		Event ev{};
-		ev.note = note;
-		ev.length = length;
-		ev.type = type;
-		ev.vibrato = vibrato;
-		m_events.push_back(ev);
+	void play(
+		Note note,
+		int octave = 1,
+		bool vibrato = false,
+		bool slide = false,
+		ArpeggioType arpeggio = ArpeggioType::Off,
+		float fineTune = 0.0f
+	) {
+		if (m_playing) {
+			m_previous.arpeggio = m_current.arpeggio;
+			m_previous.note = m_current.note;
+			m_previous.slide = m_current.slide;
+			m_previous.vibrato = m_current.vibrato;
+			m_previous.fine = m_current.fine;
+		}
+		m_current.arpeggio = arpeggio;
+		m_current.note = note + 12 * octave;
+		m_current.slide = slide;
+		m_current.vibrato = vibrato;
+		m_current.fine = fineTune;
+		m_playing = true;
+		m_sliding = slide;
+		m_amplitudeEnv.gate(true);
+		m_phase.reset();
+	}
+
+	void silence() {
+		m_amplitudeEnv.gate(false);
+		m_sliding = false;
 	}
 
 private:
 	WaveTable m_waveTable{};
 	ADSR m_amplitudeEnv{};
-	Phase m_vibratoPhase{};
 
-	bool m_portamento{ true };
+	Phase m_phase{};
 
-	std::vector<Event> m_events{};
-	float m_time{ 0.0f }, m_prevFreq{ 0.0f };
+	float m_time{ 0.0f };
 
-	Event* m_current{ nullptr };
-	int m_timeUnits, m_position{ 0 };
+	Sound m_current{}, m_previous{};
+	bool m_playing{ false }, m_sliding{ false };
+	int m_bar{ 0 };
 };
 
-static Channel p{};
+class Mixer {
+public:
+	Mixer() {
+		for (int i = 0; i < CHANNELS; i++)
+			m_channels[i] = Channel();
+	}
+
+	float sample() {
+		float mix = 0.0f;
+		for (int i = 0; i < CHANNELS; i+=2) {
+			float m = MIX(m_channels[i].sample(), m_channels[i + 1].sample());
+			mix = MIX(mix, m);
+		}
+		return mix;
+	}
+
+	float masterVolume() const { return m_masterVolume; }
+	void masterVolume(float v) { m_masterVolume = v; }
+
+	std::array<Channel, CHANNELS>& channels() { return m_channels; }
+private:
+	std::array<Channel, CHANNELS> m_channels{};
+	float m_masterVolume{ 1.0f };
+};
+
+static Mixer p{};
 
 void callback(void* udata, Uint8* stream, int len) {
 	for (int i = 0; i < len; i++) {
@@ -287,23 +366,15 @@ int main(int argc, char** argv) {
 	spec.samples = 1024;
 	spec.callback = callback;
 
-	p.pushNote(Note::C + 24, 2);
-	p.pushNote(Note::D + 24, 2);
-	p.pushNote(Note::E + 24, 2);
-	p.pushNote(Note::F + 24, 2);
-	p.pushNote(Note::G + 24, 2);
-	p.pushNote(Note::A + 24, 2);
-	p.pushNote(Note::B + 24, 2);
-	p.pushNote(Note::C + 36, 2);
-	// for (int i = 24; i < 34; i++) {
-	// 	p.pushNote(i, 1);
-	// }
-
 	if (SDL_OpenAudio(&spec, NULL) < 0) {
 		return -1;
 	}
 	SDL_PauseAudio(0);
-	SDL_Delay(3000);
+
+	p.channels()[0].play(Note::C, 4, false, false);
+	p.channels()[1].play(Note::E, 4, false, false);
+	
+	SDL_Delay(500);
 	SDL_CloseAudio();
 	return 0;
 }
