@@ -2,16 +2,18 @@
 #include <cmath>
 #include <array>
 #include <vector>
+#include <algorithm>
 
 #include "SDL2/SDL.h"
 
 #define SR 44100.0f
 #define BPM 120.0f
-#define SAMPLE(x) (Uint8(((x) * 0.5f + 0.5f) * 255.0f))
+#define SAMPLE(x) (Uint8((std::clamp((x), -1.0f, 1.0f) * 0.5f + 0.5f) * 255.0f))
 #define LERP(a, b, t) ((1.0f - (t)) * (a) + (b) * (t))
 #define MIX(a, b) ((a) + (b) - (a) * (b))
 #define HERTZ (1.0 / 60.0)
-#define CHANNELS 7
+#define CHANNELS 8
+#define MAX_TRACK_SIZE 64
 
 class Phase {
 public:
@@ -48,10 +50,19 @@ public:
 
 	float sample(float freq) {
 		float t = norm(freq);
+		if (m_noise) {
+			if (t >= 0.5f) {
+				m_lastNoise = (float(rand() % RAND_MAX) / RAND_MAX) * 2.0f - 1.0f;
+			}
+			return m_lastNoise;
+		}
 		const int i = int(std::floor(t * m_waveTable.size())) % m_waveTable.size();
 		const int n = (i + 1) % m_waveTable.size();
 		return LERP(m_waveTable[i], m_waveTable[n], t);
 	}
+
+	bool noise() const { return m_noise; }
+	void noise(bool v) { m_noise = v; }
 
 	float& operator [](unsigned int i) { return m_waveTable[i % 16]; }
 	const float& operator [](unsigned int i) const { return m_waveTable[i % 16]; }
@@ -75,6 +86,8 @@ public:
 
 private:
 	std::array<float, 24> m_waveTable{};
+	bool m_noise{ false };
+	float m_lastNoise{ 0.0f };
 };
 
 class ADSR {
@@ -200,13 +213,14 @@ enum ArpeggioType {
 	Maj7,
 	Min7,
 	Sus4,
-	Sus2
+	Sus2,
+	Octave
 };
 
 struct Sound {
 	int note{ Note::C + 24 };
 	bool vibrato{ false }, slide{ false };
-	float fine{ 0.0f };
+	float fine{ 0.0f }, volume{ 1.0f };
 
 	ArpeggioType arpeggio{ ArpeggioType::Off };
 
@@ -220,10 +234,6 @@ class Channel {
 public:
 	Channel() {
 		m_waveTable.setWaveForm(WaveTable::Sine);
-		m_amplitudeEnv.attack(0.002f);
-		m_amplitudeEnv.decay(0.0f);
-		m_amplitudeEnv.sustain(1.0f);
-		m_amplitudeEnv.release(0.5f);
 	}
 
 	float sample() {
@@ -256,6 +266,10 @@ public:
 				const int offs[4] = { 0, 3, 7, 10 };
 				noff = offs[int(m_phase.norm(HERTZ * BPM * 6) * 4)];
 			} break;
+			case ArpeggioType::Octave: {
+				const int offs[2] = { 0, 12 };
+				noff = offs[int(m_phase.norm(HERTZ * BPM * 4) * 2)];
+			} break;
 		}
 
 		float freq = m_current.frequency(noff);
@@ -277,31 +291,31 @@ public:
 			m_time -= delay;
 		}
 
-		return m_waveTable.sample(freq) * m_amplitudeEnv.sample(SR) * 0.18f;
+		float vol = m_current.volume;
+		if ((m_bar % 4) == 0) {
+			vol = LERP(m_previous.volume, vol, m_time / delay);
+		}
+
+		return m_waveTable.sample(freq) * m_amplitudeEnv.sample(SR) * vol;
 	}
 
-	void play(
-		Note note,
-		int octave = 1,
-		bool vibrato = false,
-		bool slide = false,
-		ArpeggioType arpeggio = ArpeggioType::Off,
-		float fineTune = 0.0f
-	) {
+	void play(Sound sound) {
 		if (m_playing) {
 			m_previous.arpeggio = m_current.arpeggio;
 			m_previous.note = m_current.note;
 			m_previous.slide = m_current.slide;
 			m_previous.vibrato = m_current.vibrato;
 			m_previous.fine = m_current.fine;
+			m_previous.volume = m_current.volume;
 		}
-		m_current.arpeggio = arpeggio;
-		m_current.note = note + 12 * octave;
-		m_current.slide = slide;
-		m_current.vibrato = vibrato;
-		m_current.fine = fineTune;
+		m_current.arpeggio = sound.arpeggio;
+		m_current.note = sound.note;
+		m_current.slide = sound.slide;
+		m_current.vibrato = sound.vibrato;
+		m_current.fine = sound.fine;
+		m_current.volume = sound.volume;
 		m_playing = true;
-		m_sliding = slide;
+		m_sliding = sound.slide;
 		m_amplitudeEnv.gate(true);
 		m_phase.reset();
 	}
@@ -310,6 +324,9 @@ public:
 		m_amplitudeEnv.gate(false);
 		m_sliding = false;
 	}
+
+	WaveTable& waveTable() { return m_waveTable; }
+	ADSR& amplitudeEnvelope() { return m_amplitudeEnv; }
 
 private:
 	WaveTable m_waveTable{};
@@ -324,32 +341,137 @@ private:
 	int m_bar{ 0 };
 };
 
-class Mixer {
+struct Event {
+	enum Type {
+		Empty = 0,
+		NoteOn,
+		NoteOff
+	};
+	Type type{ Empty };
+	Sound sound{};
+	int channel{ 0 };
+};
+
+enum Effect {
+	None = 0,
+	Vibrato,
+	Slide,
+	Arpeggio
+};
+
+struct EventPack {
+	uint8_t type : 4;
+	union {
+		uint8_t notePack;
+		struct { uint8_t note : 4; uint8_t oct : 4; };
+	};
+	union {
+		uint8_t effectPack;
+		struct { uint8_t effect : 4; uint8_t param : 4; };
+	};
+	uint8_t fineTune;
+};
+
+class Track {
 public:
-	Mixer() {
-		for (int i = 0; i < CHANNELS; i++)
-			m_channels[i] = Channel();
+	Track() = default;
+
+	Track(int trackSize) {
+		m_events.resize(trackSize);
 	}
 
-	float sample() {
-		float mix = 0.0f;
-		for (int i = 0; i < CHANNELS; i+=2) {
-			float m = MIX(m_channels[i].sample(), m_channels[i + 1].sample());
-			mix = MIX(mix, m);
+	void play(int index, Channel& ch) {
+		auto& ev = m_events[index];
+		switch (ev.type) {
+			case Event::Empty: break;
+			case Event::NoteOn: ch.play(ev.sound); break;
+			case Event::NoteOff: ch.silence(); break;
 		}
-		return mix;
+	}
+
+	std::vector<Event>& events() { return m_events; }
+
+private:
+	std::vector<Event> m_events{};
+};
+
+class Tracker {
+public:
+	Tracker(int trackSize = MAX_TRACK_SIZE, float sampleRate = SR) {
+		m_sampleRate = sampleRate;
+		for (int i = 0; i < CHANNELS; i++) {
+			m_channels[i] = Channel();
+			m_tracks[i] = Track(trackSize);
+		}
+	}
+
+	float sample(float bpm = 120.0f, int bars = 4) {
+		const float delay = (60000.0f / bpm) / 1000.0f;
+		m_time += (1.0f / SR) * (bars);
+		if (m_time >= delay) {
+			for (int i = 0; i < CHANNELS; i++) {
+				m_tracks[i].play(m_position, m_channels[i]);
+			}
+			m_position++;
+			m_position %= m_tracks[0].events().size();
+			m_time = 0.0f;
+		}
+
+		float mix = 0.0f;
+		for (int i = 0; i < CHANNELS; i++) {
+			mix += m_channels[i].sample();
+		}
+
+		return (mix / CHANNELS) * m_masterVolume;
 	}
 
 	float masterVolume() const { return m_masterVolume; }
 	void masterVolume(float v) { m_masterVolume = v; }
 
 	std::array<Channel, CHANNELS>& channels() { return m_channels; }
+	std::array<Track, CHANNELS>& tracks() { return m_tracks; }
+
+	void set(int channel, int pos, int pack) {
+		EventPack epack;
+		std::memcpy(&epack, &pack, sizeof(EventPack));
+		set(channel, pos, epack);
+	}
+
+	void set(int channel, int pos, EventPack pack) {
+		set(channel, pos, pack.type, (Effect)pack.effect, (int)pack.note, (int)pack.oct, (int)pack.fineTune, (int)pack.param);
+	}
+
+	void set(int channel, int pos, int type, Effect effect, int note, int oct, int fine, int param) {
+		auto& evt = m_tracks[channel].events()[pos];
+		evt.type = (Event::Type) type;
+		evt.channel = channel;
+		evt.sound = Sound{};
+		switch (effect) {
+			case Effect::Arpeggio: evt.sound.arpeggio = (ArpeggioType) param; break;
+			case Effect::Vibrato: evt.sound.vibrato = true; break;
+			case Effect::Slide: evt.sound.slide = true; break;
+			default: break;
+		}
+		evt.sound.fine = (float(fine) / 255.0f) * 10.0f;
+		evt.sound.note = note + oct * 12;
+	}
+
+	void unset(int channel, int pos) {
+		auto& evt = m_tracks[channel].events()[pos];
+		evt.type = Event::Empty;
+	}
+
 private:
-	std::array<Channel, CHANNELS> m_channels{};
-	float m_masterVolume{ 1.0f };
+	std::array<Channel, CHANNELS> m_channels;
+	std::array<Track, CHANNELS> m_tracks;
+
+	float m_masterVolume{ 1.0f }, m_sampleRate{ SR };
+
+	float m_time{ 99.0f };
+	int m_position{ 0 };
 };
 
-static Mixer p{};
+static Tracker p{};
 
 void callback(void* udata, Uint8* stream, int len) {
 	for (int i = 0; i < len; i++) {
@@ -371,10 +493,10 @@ int main(int argc, char** argv) {
 	}
 	SDL_PauseAudio(0);
 
-	p.channels()[0].play(Note::C, 4, false, false);
-	p.channels()[1].play(Note::E, 4, false, false);
+	// TNOEPFT
 	
-	SDL_Delay(500);
+	
+	SDL_Delay(1600);
 	SDL_CloseAudio();
 	return 0;
 }
